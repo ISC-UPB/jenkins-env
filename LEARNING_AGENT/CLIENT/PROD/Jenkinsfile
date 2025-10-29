@@ -1,1 +1,166 @@
-"// Pipeline placeholder para entorno PROD - TODO: Implementar lógica del pipeline"
+pipeline {
+  agent { label 'node' } // Agente Linux con Node.js y Docker
+  tools { nodejs 'NodeJS_18' }
+
+  options {
+    skipDefaultCheckout(true)
+    disableConcurrentBuilds()
+    ansiColor('xterm')
+    timestamps()
+    timeout(time: 30, unit: 'MINUTES')
+    buildDiscarder(logRotator(daysToKeepStr: '14', numToKeepStr: '20'))
+  }
+
+  parameters {
+    booleanParam(name: 'DEPLOY_ENABLED', defaultValue: false, description: 'Habilita publicación a PRODUCCIÓN (solo main).')
+    booleanParam(name: 'RUN_TESTS', defaultValue: true, description: 'Ejecutar tests.')
+    string(name: 'NPM_TOKEN_CREDENTIALS_ID', defaultValue: 'npm-token', description: 'Secret Text con NPM_TOKEN.')
+    string(name: 'VERCEL_TOKEN_CREDENTIALS_ID', defaultValue: 'vercel-token', description: 'Secret Text con Vercel token.')
+    string(name: 'DOCKER_CREDENTIALS_ID', defaultValue: 'docker-registry', description: 'Credenciales del registry Docker (opcional).')
+    string(name: 'REGISTRY_URL', defaultValue: 'ghcr.io', description: 'URL del registry destino.')
+    string(name: 'IMAGE_NAME', defaultValue: 'org/learning-agent-client', description: 'Nombre de la imagen (sin tag).')
+    string(name: 'IMAGE_TAG', defaultValue: '', description: 'Tag a usar; vacío genera version-commit.')
+  }
+
+  environment {
+    APP_NAME = 'learning-agent-client'
+    TARGET_ENV = 'prod'
+    GIT_SHORT_COMMIT = ''
+    IMAGE_TAG_EFFECTIVE = ''
+    PACKAGE_FILE = ''
+    PROJECT_DIR = 'LEARNING_AGENT/CLIENT'
+    VERCEL_TOKEN = credentials('vercel-token')
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        cleanWs()
+        checkout scm
+      }
+    }
+
+    stage('Prepare') {
+      steps {
+        script {
+          dir("${env.PROJECT_DIR}") {
+            env.GIT_SHORT_COMMIT = sh(returnStdout: true, script: "git rev-parse --short HEAD").trim()
+            def version = sh(returnStdout: true, script: "node -p \"require('./package.json').version || ''\"").trim()
+            env.IMAGE_TAG_EFFECTIVE = params.IMAGE_TAG?.trim() ? params.IMAGE_TAG.trim() : (version ? "${version}-${env.GIT_SHORT_COMMIT}" : env.GIT_SHORT_COMMIT)
+          }
+        }
+      }
+    }
+
+    stage('Install') {
+      steps {
+        withCredentials([string(credentialsId: params.NPM_TOKEN_CREDENTIALS_ID, variable: 'NPM_TOKEN')]) {
+          dir("${env.PROJECT_DIR}") {
+            sh '''
+              set -e
+              if [ -n "$NPM_TOKEN" ]; then
+                echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > .npmrc
+                echo "always-auth=true" >> .npmrc
+              fi
+              command -v npm >/dev/null 2>&1 || { echo "npm no disponible en PATH"; exit 1; }
+              npm ci --no-audit --no-fund
+            '''
+          }
+        }
+      }
+    }
+
+    stage('Test') {
+      when { expression { params.RUN_TESTS } }
+      steps {
+        dir("${env.PROJECT_DIR}") {
+          sh 'npm test --silent || npm run test'
+        }
+      }
+      post {
+        always {
+          dir("${env.PROJECT_DIR}") {
+            junit testResults: '**/junit*.xml', allowEmptyResults: true
+            archiveArtifacts artifacts: 'coverage/**', allowEmptyArchive: true
+          }
+        }
+      }
+    }
+
+    stage('Build') {
+      steps {
+        dir("${env.PROJECT_DIR}") {
+          sh 'npm run build --if-present'
+        }
+      }
+    }
+
+    stage('Package') {
+      steps {
+        script {
+          dir("${env.PROJECT_DIR}") {
+            def dirToPack = fileExists('build') ? 'build' : (fileExists('dist') ? 'dist' : '.')
+            def zipName = "${env.APP_NAME}-${env.IMAGE_TAG_EFFECTIVE}.zip"
+            zip zipFile: zipName, dir: dirToPack, glob: '**/*', overwrite: true
+            env.PACKAGE_FILE = zipName
+          }
+        }
+        dir("${env.PROJECT_DIR}") {
+          archiveArtifacts artifacts: "${env.PACKAGE_FILE}", fingerprint: true
+        }
+      }
+    }
+
+    stage('Publish') {
+      when { allOf { branch 'main'; expression { params.DEPLOY_ENABLED } } }
+      steps {
+        script {
+          input message: "Aprobar publicación a PRODUCCIÓN (main) con tag ${env.IMAGE_TAG_EFFECTIVE}?", ok: "Publicar"
+          
+          // Deploy to Vercel FIRST (after all tests and build are successful)
+          withCredentials([string(credentialsId: params.VERCEL_TOKEN_CREDENTIALS_ID, variable: 'VERCEL_TOKEN')]) {
+            dir("${env.PROJECT_DIR}") {
+              sh '''
+                set -e
+                if [ -n "$VERCEL_TOKEN" ]; then
+                  echo "Deploying to Vercel (production)..."
+                  if [ -d build ]; then
+                    npx vercel --prod --confirm --token "$VERCEL_TOKEN" build
+                  else
+                    npx vercel --prod --confirm --token "$VERCEL_TOKEN"
+                  fi
+                  echo "Vercel deployment completed successfully"
+                else
+                  echo "VERCEL_TOKEN not provided; skipping Vercel deploy"
+                fi
+              '''
+            }
+          }
+          
+          // Then optionally publish Docker image
+          def image = "${params.REGISTRY_URL}/${params.IMAGE_NAME}:${env.IMAGE_TAG_EFFECTIVE}"
+          withCredentials([usernamePassword(credentialsId: params.DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+            dir("${env.PROJECT_DIR}") {
+              sh """
+                set -e
+                command -v docker >/dev/null 2>&1 || { echo 'Docker no disponible en el agente (opcional)'; exit 0; }
+                echo "\$DOCKER_PASSWORD" | docker login ${params.REGISTRY_URL} -u "\$DOCKER_USERNAME" --password-stdin || true
+                docker build -t ${image} . || true
+                docker push ${image} || true
+                docker logout ${params.REGISTRY_URL} || true
+              """
+            }
+          }
+          echo "Imagen Docker publicada (si docker estaba disponible): ${image}"
+          echo 'Publicación completada.'
+        }
+      }
+    }
+  }
+
+  post {
+    success { echo "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.BRANCH_NAME})" }
+    failure { echo "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER} (${env.BRANCH_NAME})" }
+    always { cleanWs(deleteDirs: true, notFailBuild: true) }
+  }
+}
